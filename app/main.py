@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
 from .solver import InputConflict, solve_tracking
+from .stability import MAX_CHECK_BOXES, check_count_stability
 
 MAX_FRAMES = 10
 MAX_DETECTIONS = 30
@@ -260,17 +261,20 @@ async def put_params(sid: str, body: ParamsBody):
 
 # ---------------------------------------------------------------- 求解
 
+def _judgments_with_indices(snapshot: dict) -> list[dict]:
+    """把框号引用的判断转换为求解器使用的下标引用。"""
+    id_to_idx = {d["id"]: i for i, d in enumerate(snapshot["detections"])}
+    return [
+        {"a": id_to_idx[j["a"]], "b": id_to_idx[j["b"]], "type": j["type"]}
+        for j in snapshot["judgments"]
+    ]
+
+
 def _run_job(job_id: str, snapshot: dict):
     try:
-        # 求解器使用下标引用，这里把框号映射为下标
-        id_to_idx = {d["id"]: i for i, d in enumerate(snapshot["detections"])}
-        judgments = [
-            {"a": id_to_idx[j["a"]], "b": id_to_idx[j["b"]], "type": j["type"]}
-            for j in snapshot["judgments"]
-        ]
         result = solve_tracking(
             snapshot["detections"],
-            judgments,
+            _judgments_with_indices(snapshot),
             snapshot["params"]["w_dist"],
             snapshot["params"]["w_app"],
             snapshot["params"]["penalty"],
@@ -285,19 +289,74 @@ def _run_job(job_id: str, snapshot: dict):
         JOBS[job_id].update(status="error", error=f"求解内部错误：{exc}")
 
 
+def _run_check_job(job_id: str, snapshot: dict):
+    """计数稳定性核查任务：穷举满足全部约束的全局最优轨迹。"""
+    try:
+        result = check_count_stability(
+            snapshot["detections"],
+            _judgments_with_indices(snapshot),
+            snapshot["params"]["w_dist"],
+            snapshot["params"]["w_app"],
+            snapshot["params"]["penalty"],
+        )
+        JOBS[job_id].update(status="done", result=result)
+    except Exception as exc:  # noqa: BLE001 - 核查异常同样不能拖垮服务
+        JOBS[job_id].update(status="error", error=f"计数稳定性核查内部错误：{exc}")
+
+
+def _make_snapshot(sess: dict) -> dict:
+    return {
+        "detections": copy.deepcopy(sess["detections"]),
+        "judgments": copy.deepcopy(sess["judgments"]),
+        "params": dict(sess["params"]),
+    }
+
+
 @app.post("/api/sessions/{sid}/solve")
 async def start_solve(sid: str):
     """启动异步求解。任务记录当前输入版本，前端据此丢弃迟到结果。"""
     sess = _get_session(sid)
     job_id = uuid.uuid4().hex[:12]
-    snapshot = {
-        "detections": copy.deepcopy(sess["detections"]),
-        "judgments": copy.deepcopy(sess["judgments"]),
-        "params": dict(sess["params"]),
+    snapshot = _make_snapshot(sess)
+    JOBS[job_id] = {
+        "status": "running", "kind": "solve", "version": sess["version"],
+        "result": None, "error": None,
     }
-    JOBS[job_id] = {"status": "running", "version": sess["version"], "result": None, "error": None}
     loop = asyncio.get_running_loop()
     loop.run_in_executor(EXECUTOR, _run_job, job_id, snapshot)
+    return {"job_id": job_id, "version": sess["version"]}
+
+
+@app.post("/api/sessions/{sid}/check-stability")
+async def start_stability_check(sid: str):
+    """启动计数稳定性核查（仅对至多 6 框、当前判断可行的会话有意义）。
+
+    与求解一样异步执行并记录输入版本；改判、调参或换会话后，迟到结果由
+    前端按版本号丢弃，不会回填。
+    """
+    sess = _get_session(sid)
+    job_id = uuid.uuid4().hex[:12]
+    n_boxes = len(sess["detections"])
+    if n_boxes > MAX_CHECK_BOXES:
+        # 不在线程池里排队，直接给出 unsupported 结论（仍携带版本号）
+        return {
+            "job_id": None,
+            "version": sess["version"],
+            "result": {
+                "status": "unsupported",
+                "message": (
+                    f"计数稳定性核查仅支持至多 {MAX_CHECK_BOXES} 个检测框的会话，"
+                    f"当前 {n_boxes} 个框，未做穷举核查。"
+                ),
+            },
+        }
+    snapshot = _make_snapshot(sess)
+    JOBS[job_id] = {
+        "status": "running", "kind": "check", "version": sess["version"],
+        "result": None, "error": None,
+    }
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(EXECUTOR, _run_check_job, job_id, snapshot)
     return {"job_id": job_id, "version": sess["version"]}
 
 

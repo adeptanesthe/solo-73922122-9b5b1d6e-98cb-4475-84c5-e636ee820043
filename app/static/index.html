@@ -44,8 +44,9 @@
     </section>
 
     <section class="card">
-      <h2>4. 全局最优求解</h2>
+      <h2>4. 全局最优求解与计数核查</h2>
       <button id="solve-btn" class="primary" disabled>计算最优关联</button>
+      <button id="check-btn" disabled>计数稳定性核查（≤6 框）</button>
       <div id="solve-status" class="muted small">计算期间可继续修改判断与参数；若输入已变化，迟到的结果将自动作废，不会覆盖新输入。</div>
     </section>
   </aside>
@@ -80,6 +81,11 @@
       <div id="result-banner" class="banner muted">尚无结果。</div>
       <div id="result-summary"></div>
       <div id="trajectory-list"></div>
+      <div id="check-panel" class="check-panel hidden">
+        <h3>计数稳定性核查</h3>
+        <div id="check-banner" class="banner muted"></div>
+        <div id="check-body"></div>
+      </div>
     </section>
   </main>
 </div>

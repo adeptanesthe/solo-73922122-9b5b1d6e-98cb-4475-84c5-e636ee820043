@@ -20,6 +20,9 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  checkResult: null,      // 当前展示的计数稳定性核查结果
+  checkJobId: null,
+  checkPollTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -72,7 +75,10 @@ function loadSession(payload) {
   state.selection = [];
   state.result = null;
   state.jobId = null;
+  state.checkResult = null;
+  state.checkJobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  if (state.checkPollTimer) { clearTimeout(state.checkPollTimer); state.checkPollTimer = null; }
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -330,6 +336,8 @@ async function applyParams() {
 /* ------------------------------------------------------------ 求解 */
 
 function invalidateResult() {
+  // 改判、调参或换会话：求解结果与核查结果一并立即撤下
+  invalidateCheck(false);
   if (state.result !== null) {
     state.result = null;
     const banner = $("result-banner");
@@ -339,10 +347,35 @@ function invalidateResult() {
     $("trajectory-list").innerHTML = "";
     draw();
   }
+  updateCheckButton();
+}
+
+function invalidateCheck(showBanner = true) {
+  state.checkResult = null;
+  state.checkJobId = null;
+  if (state.checkPollTimer) { clearTimeout(state.checkPollTimer); state.checkPollTimer = null; }
+  const panel = $("check-panel");
+  panel.classList.add("hidden");
+  $("check-banner").className = "banner muted";
+  $("check-banner").textContent = "";
+  $("check-body").innerHTML = "";
+  if (showBanner) updateCheckButton();
+}
+
+function updateCheckButton() {
+  // 仅当当前展示的求解结果可行且与当前输入版本一致时才允许发起核查
+  const r = state.result;
+  $("check-btn").disabled =
+    !state.sessionId ||
+    state.detections.length === 0 ||
+    state.detections.length > 6 ||
+    !r ||
+    !r.feasible;
 }
 
 async function solve() {
   if (!state.sessionId) return;
+  invalidateCheck(); // 重新求解即撤下旧核查，待新结果出来后再按需核查
   const status = $("solve-status");
   status.classList.add("muted");
   status.style.color = "";
@@ -396,18 +429,23 @@ function renderResult() {
   const summary = $("result-summary");
   const list = $("trajectory-list");
   const r = state.result;
-  if (!r) return;
+  if (!r) {
+    updateCheckButton();
+    return;
+  }
   if (!r.feasible) {
     banner.className = "banner err";
     banner.textContent = `无解：${r.message || "约束冲突。"}`;
     summary.innerHTML = "<b>不提供动物计数。</b>";
     list.innerHTML = "";
+    updateCheckButton();
     return;
   }
   banner.className = "banner ok";
   banner.textContent = r.message || "求解成功。";
   summary.innerHTML =
-    `<div><span class="count">${r.animal_count}</span>只动物（按轨迹条数计）</div>` +
+    `<div><span class="count" id="animal-count-num">${r.animal_count}</span>` +
+    `<span id="animal-count-label">只动物（按轨迹条数计）</span></div>` +
     `<div>轨迹条数：${r.n_trajectories}</div>` +
     `<div>总代价：${r.total_cost.toFixed(3)}` +
     `（关联代价 ${r.assoc_cost.toFixed(3)} + 轨迹罚分 ${r.penalty_cost.toFixed(3)}）</div>`;
@@ -427,6 +465,158 @@ function renderResult() {
     div.append(sw, boxes, len);
     list.appendChild(div);
   });
+  updateCheckButton();
+}
+
+/* ------------------------------------------------------------ 计数稳定性核查 */
+
+async function startCheck() {
+  if (!state.sessionId || $("check-btn").disabled) return;
+  invalidateCheck();
+  const banner = $("check-banner");
+  banner.className = "banner stale";
+  banner.textContent = "计数稳定性核查计算中… 可继续修改判断与参数（修改会立即撤下本核查）。";
+  $("check-panel").classList.remove("hidden");
+  try {
+    const resp = await api(`/api/sessions/${state.sessionId}/check-stability`, { method: "POST" });
+    if (resp.job_id === null) {
+      // 框数超限等情形：后端直接给出结论
+      state.checkResult = resp.result;
+      renderCheck();
+      return;
+    }
+    state.checkJobId = resp.job_id;
+    if (state.checkPollTimer) clearTimeout(state.checkPollTimer);
+    pollCheckJob(resp.job_id);
+  } catch (err) {
+    banner.className = "banner err";
+    banner.textContent = `核查启动失败：${err.message}`;
+  }
+}
+
+async function pollCheckJob(jobId) {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    if (jobId !== state.checkJobId) return; // 已被更新的任务取代或已撤下
+    if (job.status === "running") {
+      state.checkPollTimer = setTimeout(() => pollCheckJob(jobId), 400);
+      return;
+    }
+    if (job.version !== state.version) {
+      // 迟到结果：输入在核查期间已变化，丢弃，不回填
+      const banner = $("check-banner");
+      banner.className = "banner stale";
+      banner.textContent =
+        `核查完成，但其基于旧输入（v${job.version}，当前 v${state.version}），结果已作废，未回填。请重新核查。`;
+      state.checkJobId = null;
+      return;
+    }
+    if (job.status === "error") {
+      const banner = $("check-banner");
+      banner.className = "banner err";
+      banner.textContent = job.error || "核查失败，计数仍未确定。";
+      state.checkJobId = null;
+      return;
+    }
+    state.checkResult = job.result;
+    state.checkJobId = null;
+    renderCheck();
+  } catch (err) {
+    const banner = $("check-banner");
+    banner.className = "banner err";
+    banner.textContent = `核查查询失败：${err.message}，计数仍未确定。`;
+  }
+}
+
+function markCountTentative() {
+  const num = $("animal-count-num");
+  const label = $("animal-count-label");
+  if (num) num.classList.add("tentative");
+  if (label) label.textContent = "只动物（暂定：最优轨迹计数不唯一，待补判）";
+}
+
+function renderCheck() {
+  const cr = state.checkResult;
+  if (!cr) return;
+  const panel = $("check-panel");
+  const banner = $("check-banner");
+  const body = $("check-body");
+  panel.classList.remove("hidden");
+  body.innerHTML = "";
+
+  const countsLine = (cr.distinct_counts || []).length
+    ? `可能的动物计数：${cr.distinct_counts.join("、")}（共 ${cr.n_optimal_solutions} 条代价相同的全局最优轨迹）`
+    : "";
+
+  if (cr.status === "stable") {
+    banner.className = "banner ok";
+    banner.textContent = `计数唯一确定：${cr.message}`;
+    body.innerHTML =
+      `<div>唯一最优计数：<b class="count-strong">${cr.animal_count}</b> 只动物</div>` +
+      `<div class="muted small">穷举 ${cr.n_optimal_solutions} 条全局最优轨迹，计数全部一致。</div>`;
+    return;
+  }
+
+  if (cr.status === "ambiguous") {
+    banner.className = "banner stale";
+    banner.textContent = cr.message;
+    markCountTentative();
+    const p = cr.pair;
+    const div = document.createElement("div");
+    div.className = "pair-card";
+    div.innerHTML =
+      `<div class="pair-title">建议补判框对：` +
+      `帧 ${p.a.frame} 的 <b>#${p.a.id}</b> 与 帧 ${p.b.frame} 的 <b>#${p.b.id}</b></div>` +
+      `<div class="muted small">${countsLine}</div>` +
+      `<div class="pair-counts">` +
+      `<span>判为<b>同只</b> → <b class="c-same">${p.same_count}</b> 只</span>` +
+      `<span>判为<b>异只</b> → <b class="c-diff">${p.different_count}</b> 只</span>` +
+      `</div>`;
+    const row = document.createElement("div");
+    row.className = "btn-row";
+    const btnSame = document.createElement("button");
+    btnSame.textContent = `标记 #${p.a.id} 与 #${p.b.id} 同只`;
+    btnSame.onclick = () => quickJudgment(p.a.id, p.b.id, "same");
+    const btnDiff = document.createElement("button");
+    btnDiff.textContent = `标记 #${p.a.id} 与 #${p.b.id} 异只`;
+    btnDiff.onclick = () => quickJudgment(p.a.id, p.b.id, "different");
+    row.append(btnSame, btnDiff);
+    div.append(row);
+    body.append(div);
+    return;
+  }
+
+  // undetermined / unsupported：明确说明计数仍未确定
+  banner.className = cr.status === "unsupported" ? "banner muted" : "banner err";
+  banner.textContent = cr.message || "计数仍未确定。";
+  if (countsLine) {
+    const div = document.createElement("div");
+    div.className = "muted small";
+    div.textContent = countsLine;
+    body.append(div);
+  }
+}
+
+async function quickJudgment(a, b, type) {
+  const key = pairKey(a, b);
+  const next = state.judgments
+    .filter((j) => pairKey(j.a, j.b) !== key)
+    .concat([{ a, b, type }]);
+  invalidateResult(); // 补判立即撤下旧求解与旧核查
+  try {
+    const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ judgments: next }),
+    });
+    state.version = resp.version;
+    state.judgments = next;
+    renderJudgments();
+    renderSelection();
+    draw();
+  } catch (err) {
+    alert(`保存判断失败：${err.message}`);
+  }
 }
 
 /* ------------------------------------------------------------ 汇总渲染 */
@@ -441,6 +631,8 @@ function renderAll() {
   banner.textContent = "尚无结果。";
   $("result-summary").innerHTML = "";
   $("trajectory-list").innerHTML = "";
+  invalidateCheck(false);
+  updateCheckButton();
 }
 
 /* ------------------------------------------------------------ 事件绑定 */
@@ -453,6 +645,7 @@ $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("check-btn").addEventListener("click", startCheck);
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

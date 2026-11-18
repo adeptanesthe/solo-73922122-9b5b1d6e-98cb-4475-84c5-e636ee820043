@@ -181,3 +181,110 @@ def test_unknown_session_404():
 
 def test_healthz():
     assert client.get("/healthz").json() == {"ok": True}
+
+
+# ---------------------------------------------------------------- 计数稳定性核查
+
+def _symmetric_dets():
+    # 4 框对称场景：多条等代价最优轨迹，但计数恒为 2
+    def box(bid, frame, cx, cy):
+        return {"id": bid, "frame": frame, "rect": [cx - 5, cy - 5, 10, 10],
+                "vector": [1, 0]}
+    return [
+        box("a", 0, 10, 0), box("b", 1, 20, 1),
+        box("c", 1, 20, -1), box("d", 2, 30, 0),
+    ]
+
+
+def _ambiguous_dets():
+    # 2 框：连接（1 只）与不连（2 只）总代价相等。
+    # 中心分别为 (5,5)、(15,5)，距离平方 = 100；外观正交 → 外观项 10000。
+    return [
+        {"id": "a", "frame": 0, "rect": [0, 0, 10, 10], "vector": [1, 0]},
+        {"id": "b", "frame": 1, "rect": [10, 0, 10, 10], "vector": [0, 1]},
+    ]
+
+
+def test_check_stability_stable_flow():
+    p = make_session(n_imgs=3, dets=_symmetric_dets())
+    sid = p["session_id"]
+    done = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert done["result"]["feasible"]
+
+    r = client.post(f"/api/sessions/{sid}/check-stability")
+    assert r.status_code == 200
+    job = wait_job(r.json()["job_id"])
+    assert job["kind"] == "check" and job["status"] == "done"
+    chk = job["result"]
+    assert chk["status"] == "stable"
+    assert chk["animal_count"] == done["result"]["animal_count"]
+    assert chk["n_optimal_solutions"] >= 2
+
+
+def test_check_stability_ambiguous_returns_pair_and_two_counts():
+    p = make_session(n_imgs=2, dets=_ambiguous_dets())
+    sid = p["session_id"]
+    # 边代价 = 1*100 + 10000*(1-0) = 10100，罚分取同值 → 两种方案等价
+    client.put(f"/api/sessions/{sid}/params",
+               json={"w_dist": 1.0, "w_app": 10000.0, "penalty": 10100.0})
+    done = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert done["result"]["feasible"]
+
+    job = wait_job(client.post(f"/api/sessions/{sid}/check-stability").json()["job_id"])
+    chk = job["result"]
+    assert chk["status"] == "ambiguous"
+    pair = chk["pair"]
+    assert {pair["a"]["id"], pair["b"]["id"]} == {"a", "b"}
+    assert {pair["same_count"], pair["different_count"]} == {1, 2}
+    assert chk["distinct_counts"] == [1, 2]
+
+
+def test_check_unsupported_when_more_than_six_boxes():
+    dets = [
+        {"id": f"b{i}", "frame": i % 3, "rect": [i, i, 4, 4], "vector": [1, 0]}
+        for i in range(7)
+    ]
+    p = make_session(n_imgs=3, dets=dets)
+    r = client.post(f"/api/sessions/{p['session_id']}/check-stability").json()
+    assert r["job_id"] is None
+    assert r["result"]["status"] == "unsupported"
+
+
+def test_check_infeasible_judgments_undetermined():
+    # 3 框链式布局，same+same+different 传递冲突 → 不可行
+    dets = [
+        {"id": "a", "frame": 0, "rect": [0, 0, 10, 10], "vector": [1, 0]},
+        {"id": "b", "frame": 1, "rect": [10, 0, 10, 10], "vector": [1, 0]},
+        {"id": "c", "frame": 2, "rect": [20, 0, 10, 10], "vector": [1, 0]},
+    ]
+    p = make_session(n_imgs=3, dets=dets)
+    sid = p["session_id"]
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": [
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "b", "b": "c", "type": "same"},
+        {"a": "a", "b": "c", "type": "different"},
+    ]})
+    solve_job = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert solve_job["result"]["feasible"] is False  # 原求解仍报告无解、不计数
+
+    job = wait_job(client.post(f"/api/sessions/{sid}/check-stability").json()["job_id"])
+    chk = job["result"]
+    assert chk["status"] == "undetermined"
+    assert chk["reason"] == "infeasible"
+    assert "animal_count" not in chk
+
+
+def test_check_result_invalidated_by_judgment_change():
+    p = make_session(n_imgs=3, dets=_symmetric_dets())
+    sid = p["session_id"]
+    job0 = client.post(f"/api/sessions/{sid}/check-stability").json()
+    # 核查运行期间改判 → 版本号前进
+    client.put(f"/api/sessions/{sid}/judgments",
+               json={"judgments": [{"a": "a", "b": "b", "type": "different"}]})
+    done = wait_job(job0["job_id"])
+    # 迟到结果仍带旧版本号，前端可据此丢弃、不回填
+    assert done["version"] != client.get(f"/api/sessions/{sid}").json()["version"]
+
+
+def test_check_unknown_session_404():
+    assert client.post("/api/sessions/nope/check-stability").status_code == 404
